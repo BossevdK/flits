@@ -1,0 +1,14 @@
+# geheim: ondertekeningssleutel nooit in git
+sleutel/
+*.jks
+keystore.properties
+
+# bouwresultaten
+release/
+windows/dist/
+windows/node_modules/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+.idea/
