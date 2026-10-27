@@ -21,6 +21,7 @@
       if (v === false || v == null) continue;
       if (k === 'class') n.className = v;
       else if (k === 'html') n.innerHTML = v; // alleen vaste, eigen SVG-teksten
+      else if (k === 'style') n.style.cssText = v; // via CSSOM: een style-attribuut wordt door de CSP geblokkeerd
       else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
       else n.setAttribute(k, v === true ? '' : v);
     }
@@ -184,33 +185,47 @@
     const box = $('downloads');
     const jobs = [...state.downloads.values()].reverse();
     box.replaceChildren();
-    $('btn-dl-clear').classList.toggle('hidden', !jobs.some((j) => !['starting', 'active'].includes(j.status)));
+    $('btn-dl-clear').classList.toggle('hidden', !jobs.some((j) => !['starting', 'active', 'paused'].includes(j.status)));
     for (const j of jobs.slice(0, 20)) {
       const live = j.status === 'starting' || j.status === 'active';
+      const paused = j.status === 'paused';
       const bad = j.status === 'error' || j.status === 'cancelled';
       const title = j.name || j.url;
+      const pct = j.size ? Math.min(100, (j.done / j.size) * 100) : 0;
+      const sizeText = j.size ? `${fmtSize(j.done)} van ${fmtSize(j.size)}` : fmtSize(j.done);
       let sub; let subBad = false;
       if (j.status === 'starting') sub = 'Verbinden…';
       else if (j.status === 'active') {
         const left = j.speed > 0 && j.size ? (j.size - j.done) / j.speed : NaN;
-        sub = (j.size ? `${fmtSize(j.done)} van ${fmtSize(j.size)}` : fmtSize(j.done)) + (j.speed > 0 ? ` · ${fmtSize(j.speed)}/s` : '')
-          + (j.connections > 1 ? ` · ${j.connections} verbindingen` : '') + (left ? ` · nog ${fmtEta(left)}` : '');
-      } else if (j.status === 'done') sub = fmtSize(j.size || j.done) + ' · klaar';
+        const alive = (j.slots || []).filter((x) => x >= 0).length;
+        sub = sizeText + (j.speed > 0 ? ` · ${fmtSize(j.speed)}/s` : '')
+          + (j.connections > 1 ? ` · ${alive} van ${j.connections} verbindingen` : '') + (left ? ` · nog ${fmtEta(left)}` : '');
+      } else if (paused) sub = `Gepauzeerd · ${Math.round(pct)}% · ${sizeText}`;
+      else if (j.status === 'done') sub = fmtSize(j.size || j.done) + ' · klaar';
       else if (j.status === 'cancelled') { sub = 'Geannuleerd'; subBad = true; }
-      else { sub = j.error || 'Mislukt'; subBad = true; }
-      const pct = j.size ? Math.min(100, (j.done / j.size) * 100) : 0;
+      else { sub = (j.error || 'Mislukt') + (j.resumable ? ` · ${Math.round(pct)}% staat al klaar` : ''); subBad = true; }
+
       const actions = el('div', { class: 'item-actions' });
-      if (live) actions.append(el('button', { class: 'chip-btn', onclick: () => api.cancelDownload(j.id) }, 'Annuleren'));
+      if (j.status === 'active' && j.resumable) actions.append(el('button', { class: 'chip-btn', onclick: () => api.pauseDownload(j.id) }, 'Pauzeren'));
+      if (paused || j.status === 'error') actions.append(el('button', { class: 'chip-btn', onclick: () => api.resumeDownload(j.id) }, j.resumable ? 'Hervatten' : 'Opnieuw'));
+      if (live || paused || j.status === 'error') actions.append(el('button', { class: 'chip-btn', onclick: () => api.cancelDownload(j.id) }, live || paused ? 'Annuleren' : 'Verwijderen'));
       if (j.status === 'done') {
         actions.append(el('button', { class: 'chip-btn', onclick: () => api.openPath(j.path) }, 'Openen'));
         actions.append(el('button', { class: 'chip-btn', onclick: () => api.showPath(j.path) }, 'Map'));
       }
+
+      const showDetail = (live || paused || (j.status === 'error' && j.resumable)) && j.map;
+      const map = showDetail && el('div', { class: 'pmap', 'aria-hidden': 'true' }, [...j.map].map((c) => el('i', { class: 'p' + c })));
+      const conns = live && j.slots && j.slots.length > 1 && el('div', { class: 'conns' }, j.slots.map((v, i) =>
+        el('span', { class: 'conn' + (v < 0 ? ' dead' : '') }, '#' + (i + 1) + ' ', el('b', {}, v < 0 ? 'weggevallen' : fmtSize(v) + '/s'))));
+
       box.append(el('div', { class: 'item in ' + (bad ? 'bad' : '') },
         el('div', { class: 'badge', html: bad ? ICONS.warn : ICONS.down }),
-        el('div', { style: 'min-width:0' },
+        el('div', { class: 'item-main' },
           el('div', { class: 'item-title', title }, title),
           el('div', { class: 'item-sub' + (subBad ? ' bad' : '') }, sub),
-          live && el('div', { class: 'bar' + (j.status === 'starting' ? ' wait' : '') }, el('div', { style: `width:${pct}%` }))),
+          (live || paused) && el('div', { class: 'bar' + (j.status === 'starting' ? ' wait' : '') + (paused ? ' paused' : '') }, el('div', { style: `width:${pct}%` })),
+          map, conns),
         actions));
     }
   }
@@ -395,10 +410,17 @@
     for (const j of await api.downloads()) state.downloads.set(j.id, j);
     renderDownloads();
     api.onDownload((j) => { state.downloads.set(j.id, j); renderDownloads(); });
+    const conn = $('dl-conn');
+    try { const saved = Number(localStorage.getItem('dl-conn')); if (saved >= 1 && saved <= 16) conn.value = saved; } catch (_) { /* geen opslag */ }
+    $('dl-conn-n').textContent = conn.value;
+    conn.addEventListener('input', () => {
+      $('dl-conn-n').textContent = conn.value;
+      try { localStorage.setItem('dl-conn', conn.value); } catch (_) { /* geen opslag */ }
+    });
     $('dl-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const input = $('dl-url');
-      const id = await call(api.download(input.value));
+      const id = await call(api.download(input.value, Number(conn.value)));
       if (id) input.value = '';
     });
     $('btn-dl-clear').addEventListener('click', async () => {

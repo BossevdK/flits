@@ -51,7 +51,12 @@
       <input type="text" id="dl-url" placeholder="Plak hier een link naar een bestand…" aria-label="Link naar een bestand" autocomplete="off" spellcheck="false">
       <button class="btn primary" type="submit">Downloaden</button>
     </form>
-    <div class="dl-hint">Haalt het bestand in 8 stukken tegelijk binnen en bewaart het in je map Downloads.</div>
+    <div class="dl-opts">
+      <label for="dl-conn">Verbindingen tegelijk</label>
+      <input type="range" id="dl-conn" min="1" max="16" step="1" value="8">
+      <strong id="dl-conn-n">8</strong>
+    </div>
+    <div class="dl-hint">Het bestand komt in stukken binnen in je map Downloads. Meer verbindingen is niet altijd sneller: sommige servers weigeren er te veel.</div>
     <div id="downloads" class="activity"></div>
   </section>
 

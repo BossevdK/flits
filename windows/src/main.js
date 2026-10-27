@@ -301,11 +301,13 @@ function setupIpc() {
   ipcMain.handle('history:clear', () => { history.length = 0; saveHistory(); });
 
   ipcMain.handle('dl:list', () => downloader.list());
-  ipcMain.handle('dl:add', guard((_e, url) => {
+  ipcMain.handle('dl:add', guard((_e, url, connections) => {
     if (!String(url || '').trim()) throw new Error('Plak eerst een link');
-    return downloader.add(url);
+    return downloader.add(url, connections);
   }));
   ipcMain.handle('dl:cancel', (_e, id) => downloader.cancel(id));
+  ipcMain.handle('dl:pause', (_e, id) => downloader.pause(id));
+  ipcMain.handle('dl:resume', (_e, id) => downloader.resume(id));
   ipcMain.handle('dl:clear', () => downloader.clearFinished());
 
   ipcMain.handle('update:check', () => updater.check(true));
@@ -349,7 +351,7 @@ function setupIpc() {
 
 // ---------- opstarten ----------
 app.on('second-instance', showWindow);
-app.on('before-quit', () => { quitting = true; });
+app.on('before-quit', () => { quitting = true; if (downloader) downloader.shutdown(); });
 app.on('window-all-closed', () => { /* blijf draaien in de tray */ });
 
 app.whenReady().then(async () => {
@@ -357,12 +359,13 @@ app.whenReady().then(async () => {
   loadSettings();
   updater = new Updater({ currentVersion: process.env.FLITS_FAKE_VERSION || app.getVersion(), dataDir: app.getPath('userData'), packaged: app.isPackaged, exePath: app.getPath('exe') });
   updater.on('state', (s) => send('update', s));
-  downloader = new Downloader({ getDir: () => app.getPath('downloads') });
+  downloader = new Downloader({ getDir: () => app.getPath('downloads'), stateFile: path.join(app.getPath('userData'), 'downloads.json') });
   downloader.on('job', (j) => send('download', j));
   setupIpc();
   if (!(await startWithRecovery())) { app.exit(1); return; }
   createWindow();
   createTray();
+  if (process.env.FLITS_DL_TEST) downloader.add(process.env.FLITS_DL_TEST, 8); // testhulp: start meteen een download
   updater.startAuto();
 });
 
