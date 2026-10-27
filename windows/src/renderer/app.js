@@ -12,7 +12,7 @@
     warn: '<svg viewBox="0 0 24 24"><path d="M12 2 1 21h22L12 2Zm1 14h-2v-2h2v2Zm0-4h-2V9h2v3Z"/></svg>',
   };
 
-  const state = { settings: null, peers: [], transfers: new Map(), ips: [], port: 53317, offers: [] };
+  const state = { settings: null, peers: [], transfers: new Map(), downloads: new Map(), ips: [], port: 53317, offers: [] };
 
   // ---------- hulpjes ----------
   function el(tag, attrs, ...kids) {
@@ -177,6 +177,42 @@
         live && el('div', { class: 'bar' + (t.status === 'waiting' ? ' wait' : '') }, el('div', { style: `width:${pct}%` }))),
       actions,
       isText && t.status === 'done' && el('div', { class: 'textbox' }, t.text));
+  }
+
+  // ---------- downloaden van internet ----------
+  function renderDownloads() {
+    const box = $('downloads');
+    const jobs = [...state.downloads.values()].reverse();
+    box.replaceChildren();
+    $('btn-dl-clear').classList.toggle('hidden', !jobs.some((j) => !['starting', 'active'].includes(j.status)));
+    for (const j of jobs.slice(0, 20)) {
+      const live = j.status === 'starting' || j.status === 'active';
+      const bad = j.status === 'error' || j.status === 'cancelled';
+      const title = j.name || j.url;
+      let sub; let subBad = false;
+      if (j.status === 'starting') sub = 'Verbinden…';
+      else if (j.status === 'active') {
+        const left = j.speed > 0 && j.size ? (j.size - j.done) / j.speed : NaN;
+        sub = (j.size ? `${fmtSize(j.done)} van ${fmtSize(j.size)}` : fmtSize(j.done)) + (j.speed > 0 ? ` · ${fmtSize(j.speed)}/s` : '')
+          + (j.connections > 1 ? ` · ${j.connections} verbindingen` : '') + (left ? ` · nog ${fmtEta(left)}` : '');
+      } else if (j.status === 'done') sub = fmtSize(j.size || j.done) + ' · klaar';
+      else if (j.status === 'cancelled') { sub = 'Geannuleerd'; subBad = true; }
+      else { sub = j.error || 'Mislukt'; subBad = true; }
+      const pct = j.size ? Math.min(100, (j.done / j.size) * 100) : 0;
+      const actions = el('div', { class: 'item-actions' });
+      if (live) actions.append(el('button', { class: 'chip-btn', onclick: () => api.cancelDownload(j.id) }, 'Annuleren'));
+      if (j.status === 'done') {
+        actions.append(el('button', { class: 'chip-btn', onclick: () => api.openPath(j.path) }, 'Openen'));
+        actions.append(el('button', { class: 'chip-btn', onclick: () => api.showPath(j.path) }, 'Map'));
+      }
+      box.append(el('div', { class: 'item in ' + (bad ? 'bad' : '') },
+        el('div', { class: 'badge', html: bad ? ICONS.warn : ICONS.down }),
+        el('div', { style: 'min-width:0' },
+          el('div', { class: 'item-title', title }, title),
+          el('div', { class: 'item-sub' + (subBad ? ' bad' : '') }, sub),
+          live && el('div', { class: 'bar' + (j.status === 'starting' ? ' wait' : '') }, el('div', { style: `width:${pct}%` }))),
+        actions));
+    }
   }
 
   // ---------- dialogen ----------
@@ -356,6 +392,20 @@
     state.update = s.update;
     api.onUpdate((u) => { state.update = u; renderUpdate(); const l = document.getElementById('upd-line'); if (l) l.textContent = updateLine(); });
     renderUpdate();
+    for (const j of await api.downloads()) state.downloads.set(j.id, j);
+    renderDownloads();
+    api.onDownload((j) => { state.downloads.set(j.id, j); renderDownloads(); });
+    $('dl-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = $('dl-url');
+      const id = await call(api.download(input.value));
+      if (id) input.value = '';
+    });
+    $('btn-dl-clear').addEventListener('click', async () => {
+      await api.clearDownloads();
+      for (const [id, j] of state.downloads) if (!['starting', 'active'].includes(j.status)) state.downloads.delete(id);
+      renderDownloads();
+    });
     renderHero(); renderDevices(); renderActivity();
 
     api.onPeers((list) => { state.peers = list; renderDevices(); });

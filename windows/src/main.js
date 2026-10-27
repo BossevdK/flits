@@ -6,6 +6,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { Flits, DEFAULT_PORT } = require('./core');
 const { Updater, REPO } = require('./updater');
+const { Downloader } = require('./downloader');
 
 // Voor testen: andere map en poort, zodat je twee kopieën naast elkaar kunt draaien.
 if (process.env.FLITS_DATA) app.setPath('userData', process.env.FLITS_DATA);
@@ -34,6 +35,7 @@ let quitting = false;
 let hintShown = false;
 let core = null;
 let updater = null;
+let downloader = null;
 let settings = null;
 const history = []; // afgeronde overdrachten (nieuwste eerst)
 
@@ -298,6 +300,14 @@ function setupIpc() {
   ipcMain.handle('clipboard:write', (_e, text) => clipboard.writeText(String(text)));
   ipcMain.handle('history:clear', () => { history.length = 0; saveHistory(); });
 
+  ipcMain.handle('dl:list', () => downloader.list());
+  ipcMain.handle('dl:add', guard((_e, url) => {
+    if (!String(url || '').trim()) throw new Error('Plak eerst een link');
+    return downloader.add(url);
+  }));
+  ipcMain.handle('dl:cancel', (_e, id) => downloader.cancel(id));
+  ipcMain.handle('dl:clear', () => downloader.clearFinished());
+
   ipcMain.handle('update:check', () => updater.check(true));
   ipcMain.handle('update:install', guard(async () => {
     if (await updater.install()) { quitting = true; setTimeout(() => app.quit(), 300); }
@@ -347,6 +357,8 @@ app.whenReady().then(async () => {
   loadSettings();
   updater = new Updater({ currentVersion: process.env.FLITS_FAKE_VERSION || app.getVersion(), dataDir: app.getPath('userData'), packaged: app.isPackaged, exePath: app.getPath('exe') });
   updater.on('state', (s) => send('update', s));
+  downloader = new Downloader({ getDir: () => app.getPath('downloads') });
+  downloader.on('job', (j) => send('download', j));
   setupIpc();
   if (!(await startWithRecovery())) { app.exit(1); return; }
   createWindow();
