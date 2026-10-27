@@ -78,6 +78,10 @@ h2 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 1.1p
 .update-card { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 14px;
   border: 1px solid rgba(52, 211, 153, .5); background: rgba(52, 211, 153, .10); }
 .update-title { font-weight: 650; }
+.update-card { flex-wrap: wrap; min-width: 0; }
+.update-card > div { flex: 1 1 220px; min-width: 0; }
+.update-card .item-sub { white-space: normal; overflow-wrap: anywhere; }
+.update-card .btn { flex: 0 0 auto; }
 
 /* apparaten */
 .devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }

@@ -26,22 +26,63 @@ function isNewer(remote, local) {
 const allowedHost = (h) => h === 'github.com' || h === 'api.github.com' || h.endsWith('.github.com') || h.endsWith('.githubusercontent.com');
 
 // GET met omleidingen (GitHub stuurt downloads door naar een andere server); alleen naar GitHub-hosts.
-function get(url, depth = 0) {
+function get(url, depth = 0, extra = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     if (u.protocol !== 'https:' || !allowedHost(u.hostname)) return reject(new Error('Onverwachte downloadserver'));
-    const req = https.get(url, { headers: { 'User-Agent': 'Flits', Accept: 'application/vnd.github+json' }, timeout: 20000 }, (res) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'Flits', Accept: 'application/vnd.github+json', ...extra }, timeout: 20000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         if (depth > 5) return reject(new Error('Te veel omleidingen'));
-        return resolve(get(new URL(res.headers.location, url).toString(), depth + 1));
+        return resolve(get(new URL(res.headers.location, url).toString(), depth + 1, extra));
       }
+      res.finalUrl = url;
       resolve(res);
     });
     req.on('timeout', () => req.destroy(new Error('Geen reactie van GitHub')));
     req.on('error', reject);
   });
 }
+
+// Haalt een bestand in delen tegelijk op (meerdere verbindingen, elk een eigen stuk), zodat één trage verbinding niet de snelheid bepaalt.
+// Geeft false terug als de server geen delen ondersteunt; dan moet er gewoon in één keer gedownload worden.
+async function downloadParts(url, file, size, onProgress, connections = 8) {
+  const probe = await get(url, 0, { Range: 'bytes=0-0', Accept: '*/*' });
+  probe.resume();
+  const m = /\/(\d+)$/.exec(String(probe.headers['content-range'] || ''));
+  if (probe.statusCode !== 206 || !m || (size && Number(m[1]) !== size)) return false;
+  const total = Number(m[1]);
+  const finalUrl = probe.finalUrl;
+  const fd = fs.openSync(file, 'w');
+  try {
+    const piece = Math.max(1 << 20, Math.ceil(total / (connections * 4)));
+    const queue = [];
+    for (let at = 0; at < total; at += piece) queue.push([at, Math.min(total, at + piece) - 1]);
+    let done = 0;
+    const fetchPiece = async ([from, to], attempt = 0) => {
+      try {
+        const res = await get(finalUrl, 0, { Range: `bytes=${from}-${to}`, Accept: '*/*' });
+        if (res.statusCode !== 206) { res.resume(); throw new Error('Deel downloaden mislukt (' + res.statusCode + ')'); }
+        let pos = from;
+        for await (const c of res) { fs.writeSync(fd, c, 0, c.length, pos); pos += c.length; done += c.length; onProgress(done / total); }
+        if (pos !== to + 1) throw new Error('Deel is niet compleet');
+      } catch (e) {
+        if (attempt >= 2) throw e;
+        return fetchPiece([from, to], attempt + 1);
+      }
+    };
+    const worker = async () => { for (let p = queue.shift(); p; p = queue.shift()) await fetchPiece(p); };
+    await Promise.all(Array.from({ length: Math.min(connections, queue.length) }, worker));
+    return true;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const hashFile = (file) => new Promise((resolve, reject) => {
+  const h = crypto.createHash('sha256');
+  fs.createReadStream(file).on('data', (c) => h.update(c)).on('error', reject).on('end', () => resolve(h.digest('hex')));
+});
 
 class Updater extends EventEmitter {
   constructor({ currentVersion, dataDir, packaged = false, exePath = '' }) {
@@ -102,12 +143,20 @@ class Updater extends EventEmitter {
       fs.mkdirSync(this.dir, { recursive: true });
       const file = path.join(this.dir, `Flits-${info.version}-Setup.exe`);
       this._set({ status: 'downloading', version: info.version, progress: 0 });
+      let last = 0;
+      const progress = (p) => { const now = Date.now(); if (now - last > 150) { last = now; this._set({ status: 'downloading', version: info.version, progress: Math.min(1, p) }); } };
+      let parted = false;
+      try { parted = await downloadParts(info.url, file, info.size, progress); } catch (_) { parted = false; }
+      if (parted) {
+        if (info.size && fs.statSync(file).size !== info.size) throw new Error('Download is niet compleet');
+        if (info.sha256 && (await hashFile(file)) !== info.sha256.toLowerCase()) throw new Error('Controlesom klopt niet, download is beschadigd');
+      } else {
       const res = await get(info.url);
       if (res.statusCode !== 200) { res.resume(); throw new Error(`Downloaden mislukt (${res.statusCode})`); }
       const total = Number(res.headers['content-length']) || info.size;
       const hash = crypto.createHash('sha256');
       const out = fs.createWriteStream(file);
-      let done = 0; let last = 0;
+      let done = 0;
       await new Promise((resolve, reject) => {
         res.on('data', (c) => {
           hash.update(c); done += c.length;
@@ -121,6 +170,7 @@ class Updater extends EventEmitter {
       });
       if (info.size && done !== info.size) throw new Error('Download is niet compleet');
       if (info.sha256 && hash.digest('hex') !== info.sha256.toLowerCase()) throw new Error('Controlesom klopt niet, download is beschadigd');
+      }
 
       // Een klein scriptje draait de installer stil (die sluit Flits af en werkt bij) en start daarna de nieuwe versie.
       const script = path.join(this.dir, 'update.cmd');
