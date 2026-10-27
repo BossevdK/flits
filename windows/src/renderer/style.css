@@ -179,6 +179,7 @@ input[type=text], textarea { width: 100%; padding: 10px 12px; border-radius: 10p
 textarea { min-height: 110px; resize: vertical; }
 .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid var(--line); }
 .setting small { display: block; color: var(--muted); font-size: 12px; }
+.setting small.bad { color: var(--bad); }
 .pathline { display: flex; gap: 8px; }
 .pathline input { flex: 1; }
 .switch { position: relative; width: 42px; height: 24px; flex: none; }

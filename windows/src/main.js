@@ -99,6 +99,7 @@ function createWindow() {
   // Testhulp: FLITS_SHOT=pad.png maakt na een paar seconden een schermafbeelding en sluit af.
   if (process.env.FLITS_SHOT) {
     win.webContents.once('did-finish-load', () => setTimeout(async () => {
+      if (process.env.FLITS_SHOT_CLICK) { await win.webContents.executeJavaScript('document.querySelector(' + JSON.stringify(process.env.FLITS_SHOT_CLICK) + ').click()'); await new Promise((r) => setTimeout(r, 600)); }
       const img = await win.webContents.capturePage();
       fs.writeFileSync(process.env.FLITS_SHOT, img.toPNG());
       quitting = true; app.quit();

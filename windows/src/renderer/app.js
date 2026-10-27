@@ -279,9 +279,23 @@
     const u = state.update || {};
     if (u.status === 'checking') return 'Controleren…';
     if (u.status === 'uptodate') return 'Je hebt de nieuwste versie.';
-    if (['available', 'downloading', 'restarting'].includes(u.status)) return 'Er is een nieuwe versie, zie het hoofdscherm.';
-    if (u.status === 'error' && !u.version) return u.error;
+    if (u.status === 'available') return 'Nieuwe versie ' + u.version + ' beschikbaar.';
+    if (u.status === 'downloading') return 'Downloaden… ' + Math.round((u.progress || 0) * 100) + '%';
+    if (u.status === 'restarting') return 'Flits start zo opnieuw op…';
+    if (u.status === 'error') return u.error;
     return 'Flits werkt zichzelf bij vanaf GitHub.';
+  }
+
+  // De regel met de versie in de instellingen; bij een nieuwe versie staat hier ook de knop om bij te werken.
+  function settingsUpdateRow() {
+    const u = state.update || {};
+    const canInstall = u.version && (u.status === 'available' || u.status === 'error');
+    const busy = u.status === 'downloading' || u.status === 'restarting' || u.status === 'checking';
+    const btn = canInstall
+      ? el('button', { class: 'btn primary', onclick: async () => { await call(api.installUpdate()); } }, u.status === 'error' ? 'Opnieuw' : 'Nu bijwerken')
+      : el('button', { class: 'btn', disabled: busy, onclick: () => api.checkUpdate() }, 'Controleer');
+    return el('div', { class: 'setting', id: 'upd-row' },
+      el('div', {}, 'Versie ' + state.settings.version, el('small', { class: u.status === 'error' ? 'bad' : '' }, updateLine())), btn);
   }
 
   function settingsDialog() {
@@ -309,9 +323,7 @@
       sw('autoAcceptAll', 'Alles automatisch accepteren', 'Minder veilig: iedereen op je netwerk kan dan bestanden sturen.'),
       sw('minimizeToTray', 'Op de achtergrond blijven', 'Sluiten verbergt Flits bij de klok, zodat je altijd kunt ontvangen.'),
       sw('startWithWindows', 'Starten met Windows', 'Flits staat dan klaar zodra je pc aan gaat.'),
-      el('div', { class: 'setting' },
-        el('div', {}, 'Versie ' + s.version, el('small', { id: 'upd-line' }, updateLine())),
-        el('button', { class: 'btn', onclick: () => api.checkUpdate() }, 'Controleer')),
+      settingsUpdateRow(),
       el('div', { class: 'setting' },
         el('div', {}, 'Vertrouwde apparaten', el('small', {}, s.trustedCount ? s.trustedCount + ' apparaat(en) mogen zonder vragen sturen.' : 'Nog geen. Kies bij een verzoek “Altijd toestaan”.')),
         s.trustedCount ? el('button', { class: 'btn', onclick: async () => {
@@ -405,7 +417,7 @@
     for (const t of s.active) state.transfers.set(t.id, t);
     state.offers.push(...s.offers);
     state.update = s.update;
-    api.onUpdate((u) => { state.update = u; renderUpdate(); const l = document.getElementById('upd-line'); if (l) l.textContent = updateLine(); });
+    api.onUpdate((u) => { state.update = u; renderUpdate(); const r = $('upd-row'); if (r) r.replaceWith(settingsUpdateRow()); });
     renderUpdate();
     for (const j of await api.downloads()) state.downloads.set(j.id, j);
     renderDownloads();
