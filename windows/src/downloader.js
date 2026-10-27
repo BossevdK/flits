@@ -14,7 +14,7 @@ const crypto = require('crypto');
 const DEFAULT_CONNECTIONS = 8;
 const MAX_CONNECTIONS = 16;
 const MIN_PIECE = 1024 * 1024;
-const MAX_PIECE = 8 * 1024 * 1024;
+const MIN_SPLIT = 4 * 1024 * 1024; // een stuk dat nog zoveel te gaan heeft mag door een vrije verbinding worden gedeeld
 const MAX_REDIRECTS = 8;
 const MAP_CELLS = 96;
 const MAX_PIECE_TRIES = 6; // zo vaak mag één stuk mislukken voordat de download stopt
@@ -102,7 +102,7 @@ class Downloader extends EventEmitter {
         if (!s || !s.id || !s.url || !s.part || !Array.isArray(s.pieces) || !fs.existsSync(s.part)) continue;
         const j = this._newJob(s.url, s.want);
         Object.assign(j, { id: s.id, name: s.name, path: s.path, part: s.part, size: s.size, tag: s.tag || '', pieces: s.pieces });
-        j.have = new Uint8Array(s.pieces.length);
+        j.have = new Array(s.pieces.length).fill(0);
         for (const i of s.doneIdx || []) if (i >= 0 && i < j.have.length) j.have[i] = 2;
         for (const [i, b] of s.partial || []) if (i >= 0 && i < j.have.length && j.have[i] !== 2 && b > 0 && b < j.pieces[i][1] - j.pieces[i][0] + 1) j.partial.set(i, b);
         j.done = j.pieces.reduce((a, p, i) => a + (j.have[i] === 2 ? p[1] - p[0] + 1 : (j.partial.get(i) || 0)), 0);
@@ -242,11 +242,13 @@ class Downloader extends EventEmitter {
     try { if (j.part) fs.unlinkSync(j.part); } catch (_) { /* weg */ }
   }
 
+  // Het bestand wordt in evenveel delen verdeeld als er verbindingen zijn. Een verbinding die klaar is, neemt later de helft over van het stuk dat nog het langst duurt.
   _layout(j, total) {
-    const piece = Math.max(MIN_PIECE, Math.min(MAX_PIECE, Math.ceil(total / (j.want * 4))));
+    const n = Math.max(1, Math.min(j.want, Math.ceil(total / MIN_PIECE)));
+    const size = Math.ceil(total / n);
     j.pieces = [];
-    for (let at = 0; at < total; at += piece) j.pieces.push([at, Math.min(total, at + piece) - 1]);
-    j.have = new Uint8Array(j.pieces.length);
+    for (let at = 0; at < total; at += size) j.pieces.push([at, Math.min(total, at + size) - 1]);
+    j.have = new Array(j.pieces.length).fill(0);
     j.partial = new Map();
     j.done = 0;
   }
@@ -317,7 +319,8 @@ class Downloader extends EventEmitter {
     const queue = [];
     j.have.forEach((v, i) => { if (v !== 2) queue.push(i); });
     const tries = new Map();
-    j.connections = Math.min(j.want, queue.length);
+    const remaining = j.size - j.done;
+    j.connections = Math.max(1, Math.min(j.want, Math.max(queue.length, Math.ceil(remaining / (2 * MIN_SPLIT)))));
     j.slots = Array(j.connections).fill(0);
     j.slotBytes = Array(j.connections).fill(0);
     this._emit(j);
@@ -325,29 +328,55 @@ class Downloader extends EventEmitter {
     let lastError = null;
 
     // Een stuk dat half binnen was gaat verder waar het stopte (j.partial onthoudt hoeveel er al staat).
+    // De eindpositie van een stuk kan korter worden als een andere verbinding de helft overneemt (zie split).
     const fetchPiece = async (idx, slot) => {
-      const [from, to] = j.pieces[idx];
+      const piece = j.pieces[idx];
+      const from = piece[0];
       let pos = from + (j.partial.get(idx) || 0);
-      if (pos > to) return true;
-      const res = await request(url, { Range: `bytes=${pos}-${to}` });
+      if (pos > piece[1]) return true;
+      const res = await request(url, { Range: `bytes=${pos}-${piece[1]}` });
       this._track(j, res);
       if (res.statusCode !== 206) { res.resume(); throw new Error(`De server weigerde een stuk (${res.statusCode})`); }
-      for await (const c of res) {
+      for await (let c of res) {
         if (this._stopped(j, gen)) return false;
-        fs.writeSync(j.fd, c, 0, c.length, pos);
-        pos += c.length; j.done += c.length; j.slotBytes[slot] += c.length;
-        j.partial.set(idx, pos - from);
+        const room = piece[1] + 1 - pos;
+        if (c.length > room) c = c.subarray(0, Math.max(0, room));
+        if (c.length) {
+          fs.writeSync(j.fd, c, 0, c.length, pos);
+          pos += c.length; j.done += c.length; j.slotBytes[slot] += c.length;
+          j.partial.set(idx, pos - from);
+        }
+        if (pos > piece[1]) break; // klaar, of de rest is door een andere verbinding overgenomen
       }
-      if (pos !== to + 1) throw new Error('Stuk is niet compleet');
+      if (pos !== piece[1] + 1) throw new Error('Stuk is niet compleet');
       j.partial.delete(idx);
       return true;
+    };
+
+    // Is de rij leeg, dan deelt een vrije verbinding het stuk dat nog het meest te gaan heeft: de helft wordt een nieuw stuk.
+    const split = () => {
+      let best = -1; let bestLeft = 0;
+      j.have.forEach((h, i) => {
+        if (h !== 1) return;
+        const left = j.pieces[i][1] + 1 - (j.pieces[i][0] + (j.partial.get(i) || 0));
+        if (left > bestLeft) { bestLeft = left; best = i; }
+      });
+      if (best < 0 || bestLeft < MIN_SPLIT) return -1;
+      const [f, t] = j.pieces[best];
+      const pos = f + (j.partial.get(best) || 0);
+      const mid = pos + Math.floor((t + 1 - pos) / 2) - 1; // het oude stuk loopt voortaan tot en met mid
+      j.pieces[best][1] = mid;
+      j.pieces.push([mid + 1, t]);
+      j.have.push(0);
+      return j.pieces.length - 1;
     };
 
     const worker = async (slot) => {
       let strikes = 0;
       while (!fatal && !this._stopped(j, gen)) {
-        const idx = queue.shift();
-        if (idx === undefined) break;
+        let idx = queue.shift();
+        if (idx === undefined) idx = split();
+        if (idx === undefined || idx < 0) break;
         j.have[idx] = 1;
         try {
           if (await fetchPiece(idx, slot)) { j.have[idx] = 2; strikes = 0; this._saveSoon(); } else { j.have[idx] = 0; }
@@ -372,18 +401,26 @@ class Downloader extends EventEmitter {
     if (queue.length) throw lastError || new Error('Alle verbindingen zijn weggevallen');
   }
 
-  // Compacte kaart van de stukken: 0 = nog niet, 1 = bezig of gedeeltelijk, 2 = binnen.
+  // Compacte kaart van het bestand: 0 = nog niet, 1 = bezig of gedeeltelijk, 2 = binnen. Alleen voor de weergave.
   _map(j) {
-    if (!j.have || !j.have.length) return '';
-    const n = j.have.length;
-    const cells = Math.min(n, MAP_CELLS);
+    if (!j.pieces || !j.have || !j.size) return '';
+    const cells = Math.min(MAP_CELLS, Math.max(1, Math.ceil(j.size / MIN_PIECE)));
+    const cell = j.size / cells;
+    const cov = new Float64Array(cells);
+    const touched = new Uint8Array(cells);
+    j.pieces.forEach(([f, t], i) => {
+      const len = t - f + 1;
+      const got = j.have[i] === 2 ? len : Math.min(len, j.partial.get(i) || 0);
+      if (j.have[i] === 1) touched[Math.min(cells - 1, Math.floor((f + got) / cell))] = 1;
+      if (got <= 0) return;
+      const end = f + got;
+      for (let c = Math.floor(f / cell); c <= Math.min(cells - 1, Math.floor((end - 1) / cell)); c++) {
+        const lo = Math.max(f, c * cell); const hi = Math.min(end, (c + 1) * cell);
+        if (hi > lo) cov[c] += hi - lo;
+      }
+    });
     let out = '';
-    for (let c = 0; c < cells; c++) {
-      const a = Math.floor((c * n) / cells); const b = Math.floor(((c + 1) * n) / cells);
-      let done = 0; let any = 0;
-      for (let i = a; i < b; i++) { if (j.have[i] === 2) done++; if (j.have[i] > 0) any++; }
-      out += done === b - a ? '2' : any ? '1' : '0';
-    }
+    for (let c = 0; c < cells; c++) out += cov[c] >= cell - 1 ? '2' : (cov[c] > 0 || touched[c]) ? '1' : '0';
     return out;
   }
 }

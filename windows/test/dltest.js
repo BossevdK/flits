@@ -9,7 +9,7 @@ const { Downloader, cleanName } = require('../src/downloader');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'flits-dl-'));
 const data = crypto.randomBytes(20 * 1024 * 1024 + 123);
-let ranged = 0; let open = 0; let flaky = 0; let served = 0;
+let ongelijk = 0; let ranged = 0; let open = 0; let flaky = 0; let served = 0;
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
   if (u.pathname === '/go') { res.writeHead(302, { Location: '/files/big%20file.bin' }); return res.end(); }
@@ -27,10 +27,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, h);
     return res.end(data);
   }
-  if (u.pathname === '/trage' || u.pathname === '/beperkt' || u.pathname === '/wispelturig') {
+  if (u.pathname === '/trage' || u.pathname === '/beperkt' || u.pathname === '/wispelturig' || u.pathname === '/ongelijk') {
     const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
     if (!m) { res.writeHead(200, { 'Content-Length': data.length, ETag: '"v1"' }); return res.end(data); }
     const a = Number(m[1]); const b = m[2] ? Math.min(Number(m[2]), data.length - 1) : data.length - 1;
+    if (u.pathname === '/ongelijk') ongelijk++;
     if (u.pathname === '/beperkt') { // maximaal 3 verbindingen tegelijk
       if (open >= 3) { res.writeHead(429); return res.end(); }
     }
@@ -43,7 +44,7 @@ const server = http.createServer((req, res) => {
       const end = Math.min(b + 1, at + 32 * 1024);
       served += end - at;
       res.write(data.subarray(at, end)); at = end;
-      if (at > b) res.end(); else setTimeout(tick, u.pathname === '/trage' ? 25 : 2);
+      if (at > b) res.end(); else if (u.pathname === '/ongelijk' && a !== 0) setImmediate(tick); else setTimeout(tick, u.pathname === '/trage' ? 25 : u.pathname === '/ongelijk' ? 20 : 2);
     };
     return tick();
   }
@@ -64,7 +65,7 @@ server.listen(0, '127.0.0.1', async () => {
   let j = await waitDone(dl, dl.add(base + '/go'));
   ok(j.status === 'done' && path.basename(j.path) === 'big file.bin', 'omleiding gevolgd, bestandsnaam uit de link ' + j.status + ' ' + j.error);
   ok(fs.readFileSync(j.path).equals(data), 'bestand identiek na 8 stukken tegelijk');
-  ok(ranged > 8 && dl.jobs.get(j.id).connections === 8, `stukken apart opgehaald (${ranged} verzoeken, 8 verbindingen)`);
+  ok(ranged >= 9 && ranged <= 30 && dl.jobs.get(j.id).connections === 8, `8 delen voor 8 verbindingen, weinig verzoeken (${ranged} verzoeken in totaal)`);
 
   j = await waitDone(dl, dl.add(base + '/go', 16));
   ok(j.connections === 16, 'schuif op 16 geeft 16 verbindingen');
@@ -120,6 +121,13 @@ server.listen(0, '127.0.0.1', async () => {
   dl.cancel(id);
   await sleep(200);
   ok(dl.jobs.get(id).status === 'cancelled' && !fs.readdirSync(dir).some((f) => f.endsWith('.part')), 'annuleren ruimt het halve bestand op');
+  // één trage verbinding houdt de rest niet op: een vrije verbinding neemt de helft van het trage stuk over
+  { const r0 = ongelijk; const t0 = Date.now(); const uj = await waitDone(dl, dl.add(base + '/ongelijk', 2)); const dt = Date.now() - t0;
+    ok(uj.status === 'done' && fs.readFileSync(uj.path).equals(data), 'trage verbinding: bestand toch identiek');
+    ok(ongelijk - r0 > 3 && dt < 6000, `trage deel wordt gedeeld (${ongelijk - r0} verzoeken, ${(dt / 1000).toFixed(1)} s; zonder delen ongeveer 10 s)`); }
+  const lay = (size, want) => { const j = { want }; dl._layout(j, size); return j.pieces.length; };
+  ok(lay(2147450683, 16) === 16 && lay(2147450683, 8) === 8 && lay(5, 8) === 1, 'bestand wordt in evenveel delen verdeeld als verbindingen (2 GB: 16 delen bij 16 verbindingen)');
+  ok(lay(20 * 1024 * 1024, 8) === 8, 'ook een bestand van 20 MB wordt in 8 delen verdeeld');
   ok(cleanName('CON') === '_CON' && cleanName('a/b\\c') === 'a_b_c', 'gereserveerde namen en slashes worden veilig');
 
   server.close();
