@@ -44,8 +44,10 @@ function get(url, depth = 0) {
 }
 
 class Updater extends EventEmitter {
-  constructor({ currentVersion, dataDir }) {
+  constructor({ currentVersion, dataDir, packaged = false, exePath = '' }) {
     super();
+    this.packaged = packaged;
+    this.exePath = exePath;
     this.current = currentVersion;
     this.dir = path.join(dataDir, 'updates');
     this.state = { status: 'idle', current: currentVersion };
@@ -91,15 +93,14 @@ class Updater extends EventEmitter {
   // Downloadt de nieuwe versie en start het vervangen. Geeft true terug als Flits nu moet afsluiten.
   async install() {
     if (!this.info) throw new Error('Geen update beschikbaar');
-    const target = process.env.PORTABLE_EXECUTABLE_FILE;
-    if (!target) throw new Error('Zelf bijwerken werkt alleen in de gewone Flits.exe. Download de nieuwe versie van GitHub.');
-    if (/[%&^!]/.test(target)) throw new Error('De map van Flits.exe heeft tekens (% & ^ !) waardoor bijwerken niet kan. Verplaats Flits.exe.');
+    if (!this.packaged) throw new Error('Zelf bijwerken werkt alleen in de geïnstalleerde Flits. Download de nieuwe versie van GitHub.');
+    if (/[%&^!]/.test(this.exePath + this.dir)) throw new Error('Het pad van Flits bevat tekens (% & ^ !) waardoor bijwerken niet kan. Download de nieuwe versie van GitHub.');
     const info = this.info;
     this.busy = true;
     try {
       fs.rmSync(this.dir, { recursive: true, force: true });
       fs.mkdirSync(this.dir, { recursive: true });
-      const file = path.join(this.dir, `Flits-${info.version}.exe`);
+      const file = path.join(this.dir, `Flits-${info.version}-Setup.exe`);
       this._set({ status: 'downloading', version: info.version, progress: 0 });
       const res = await get(info.url);
       if (res.statusCode !== 200) { res.resume(); throw new Error(`Downloaden mislukt (${res.statusCode})`); }
@@ -121,14 +122,14 @@ class Updater extends EventEmitter {
       if (info.size && done !== info.size) throw new Error('Download is niet compleet');
       if (info.sha256 && hash.digest('hex') !== info.sha256.toLowerCase()) throw new Error('Controlesom klopt niet, download is beschadigd');
 
-      // Wacht tot Flits is gesloten, vervang dan het bestand en start de nieuwe versie.
+      // Een klein scriptje draait de installer stil (die sluit Flits af en werkt bij) en start daarna de nieuwe versie.
       const script = path.join(this.dir, 'update.cmd');
       fs.writeFileSync(script, [
-        '@echo off', 'set n=0', ':retry', 'set /a n+=1', 'if %n% gtr 90 exit /b 1',
-        'ping -n 2 127.0.0.1 >nul',
-        `move /Y "${file}" "${target}" >nul 2>&1`,
-        'if errorlevel 1 goto retry',
-        `start "" "${target}"`, 'exit /b 0',
+        '@echo off',
+        'ping -n 3 127.0.0.1 >nul',
+        `start "" /wait "${file}" /S`,
+        `start "" "${this.exePath}"`,
+        'exit /b 0',
       ].join('\r\n'));
       this._set({ status: 'restarting', version: info.version });
       spawn('cmd.exe', ['/c', script], { detached: true, stdio: 'ignore', windowsHide: true }).unref();

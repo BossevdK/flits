@@ -141,7 +141,7 @@ class Flits extends EventEmitter {
   stop() {
     (this._timers || []).forEach(clearInterval);
     try { this.udp.close(); } catch (_) { /* al dicht */ }
-    try { this.server.close(); } catch (_) { /* al dicht */ }
+    try { this.server.close(); if (this.server.closeAllConnections) this.server.closeAllConnections(); } catch (_) { /* al dicht */ }
     for (const o of this.outgoing.values()) o.abort();
   }
 

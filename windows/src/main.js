@@ -11,6 +11,17 @@ const { Updater, REPO } = require('./updater');
 if (process.env.FLITS_DATA) app.setPath('userData', process.env.FLITS_DATA);
 const PORT = Number(process.env.FLITS_PORT) || DEFAULT_PORT;
 
+// De interface is eenvoudig; software-rendering voorkomt zwarte vensters en crashes van het grafische deel.
+app.disableHardwareAcceleration();
+
+// Logboek in de gegevensmap (flits.log), zodat een crash achteraf te onderzoeken is.
+const logFile = () => path.join(app.getPath('userData'), 'flits.log');
+function log(...parts) {
+  try { fs.appendFileSync(logFile(), `${new Date().toISOString()} ${parts.join(' ')}\n`); } catch (_) { /* geen logboek is niet erg */ }
+}
+process.on('uncaughtException', (e) => log('uncaughtException', e && e.stack || e));
+process.on('unhandledRejection', (e) => log('unhandledRejection', e && e.stack || e));
+
 if (!process.env.FLITS_DATA && !app.requestSingleInstanceLock()) {
   app.quit();
   process.exit(0);
@@ -20,6 +31,7 @@ const ICON = path.join(__dirname, '..', 'build', 'icon.png');
 let win = null;
 let tray = null;
 let quitting = false;
+let hintShown = false;
 let core = null;
 let updater = null;
 let settings = null;
@@ -91,7 +103,19 @@ function createWindow() {
     }, Number(process.env.FLITS_SHOT_DELAY) || 4000));
   }
   win.on('close', (e) => {
-    if (!quitting && settings.minimizeToTray) { e.preventDefault(); win.hide(); }
+    if (!quitting && settings.minimizeToTray) {
+      e.preventDefault();
+      win.hide();
+      if (!hintShown) {
+        hintShown = true;
+        notify('Flits draait nog', 'Flits staat bij de klok en ontvangt nog. Kies Afsluiten bij dat pictogram om te stoppen.', showWindow);
+      }
+    }
+  });
+  win.on('unresponsive', () => log('venster reageert niet'));
+  win.webContents.on('render-process-gone', (_e, d) => {
+    log('renderer weg:', d.reason);
+    if (!win.isDestroyed()) win.reload();
   });
   // Links in de app openen nooit in dit venster.
   win.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:/.test(url)) shell.openExternal(url); return { action: 'deny' }; });
@@ -152,6 +176,63 @@ async function startCore() {
   core.on('text-received', (t) => notify('Tekst van ' + t.peer.name, t.text.slice(0, 120), showWindow));
   await core.start();
   for (const h of settings.manualHosts) core.addManual(h).catch(() => {});
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Wie luistert er op onze poort? (naam en proces-id, via netstat en tasklist)
+function findPortHolder() {
+  try {
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', windowsHide: true });
+    const line = out.split(/\r?\n/).find((l) => /LISTENING/i.test(l) && new RegExp(`:${PORT}\\s`).test(l));
+    if (!line) return null;
+    const pid = Number(line.trim().split(/\s+/).pop());
+    if (!pid || pid === process.pid) return null;
+    const t = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true });
+    const name = (t.match(/^"([^"]+)"/) || [])[1] || 'onbekend programma';
+    return { pid, name };
+  } catch (e) {
+    log('findPortHolder', e.message);
+    return null;
+  }
+}
+
+// Start de kern. Is de poort bezet (bijvoorbeeld een oude Flits die nog op de achtergrond draait), dan even
+// wachten, daarna uitleggen wie de poort vasthoudt en aanbieden om dat oude proces te stoppen.
+async function startWithRecovery() {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      await startCore();
+      return true;
+    } catch (e) {
+      log('start mislukt:', e.code || '', e.message);
+      if (e.code !== 'EADDRINUSE') {
+        dialog.showErrorBox('Flits kan niet starten', String(e.message || e));
+        return false;
+      }
+      if (attempt < 3) { await sleep(700); continue; } // vorige Flits is misschien nog aan het afsluiten
+      const holder = findPortHolder();
+      const isFlits = holder && /flits/i.test(holder.name);
+      if (isFlits) {
+        const r = dialog.showMessageBoxSync({
+          type: 'question', buttons: ['Opnieuw starten', 'Annuleren'], defaultId: 0, cancelId: 1, title: 'Flits',
+          message: 'Flits draait al op de achtergrond',
+          detail: 'Er draait nog een Flits-venster dat niet meer zichtbaar is. Wil je dat afsluiten en Flits opnieuw starten?\n(Loopt er nog een overdracht, kies dan Annuleren en sluit Flits via het pictogram bij de klok.)',
+        });
+        if (r !== 0) return false;
+        try { process.kill(holder.pid); } catch (_) { /* al weg */ }
+        require('child_process').spawnSync('taskkill', ['/PID', String(holder.pid), '/T', '/F'], { windowsHide: true });
+        await sleep(1200);
+        continue;
+      }
+      dialog.showErrorBox('Flits kan niet starten', holder
+        ? `Poort ${PORT} wordt gebruikt door "${holder.name}" (proces ${holder.pid}). Sluit dat programma en start Flits opnieuw.`
+        : `Poort ${PORT} is al in gebruik door een ander programma. Sluit dat en start Flits opnieuw.`);
+      return false;
+    }
+  }
+  return false;
 }
 
 function rememberTransfer(t) {
@@ -264,21 +345,16 @@ app.on('window-all-closed', () => { /* blijf draaien in de tray */ });
 app.whenReady().then(async () => {
   app.setAppUserModelId('nl.flits.app');
   loadSettings();
-  updater = new Updater({ currentVersion: process.env.FLITS_FAKE_VERSION || app.getVersion(), dataDir: app.getPath('userData') });
+  updater = new Updater({ currentVersion: process.env.FLITS_FAKE_VERSION || app.getVersion(), dataDir: app.getPath('userData'), packaged: app.isPackaged, exePath: app.getPath('exe') });
   updater.on('state', (s) => send('update', s));
   setupIpc();
-  try {
-    await startCore();
-  } catch (e) {
-    dialog.showErrorBox('Flits kan niet starten', e.code === 'EADDRINUSE'
-      ? `Poort ${PORT} is al in gebruik. Draait Flits al ergens anders?`
-      : String(e.message || e));
-    app.exit(1);
-    return;
-  }
+  if (!(await startWithRecovery())) { app.exit(1); return; }
   createWindow();
   createTray();
   updater.startAuto();
 });
 
-app.on('will-quit', () => { if (core) core.stop(); });
+app.on('will-quit', () => {
+  if (core) core.stop();
+  setTimeout(() => app.exit(0), 2000).unref(); // zeker weten dat er niets blijft hangen dat de poort vasthoudt
+});
